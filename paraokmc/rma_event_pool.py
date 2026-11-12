@@ -1,0 +1,1378 @@
+# Copyright (c) 2026 Beihang University
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Event pool module
+
+Core features:
+1. Three event classes stored separately (zero-object, single-object, pair)
+2. Events stored purely locally (NumPy arrays, never shared)
+3. A single RMA window: synchronization of the rate sum
+4. Bulk insertion and query
+5. Incremental update support (together with incremental_update_v16)
+
+- Dynamic dtype support (adaptive memory layout)
+- The hardcoded MAX_PARAMS/MAX_OBJS constants were removed
+- The dtype is generated dynamically by config_analyzer.TypeCompiler
+- Self-contained events are supported (an OBJECT_DTYPE structure is embedded)
+
+Architecture:
+- event arrays: stored entirely locally, no RMA window
+- RMA window: only for the rate sum (the interface is kept for future use)
+"""
+
+import numpy as np
+from mpi4py import MPI
+from typing import List, Dict, Optional, Tuple
+from numba import njit, prange
+
+
+# ===== Event status enumeration =====
+STATUS_TODO = 0      # pending
+STATUS_BUSY = 1      # being computed
+STATUS_DONE = 2      # completed
+STATUS_SENT = 3      # handed to another rank (runtime load balancing)
+
+
+# ===== JIT-optimized ghost event cleanup =====
+
+@njit(cache=True)
+def _find_events_to_keep_jit(event_obj_ids: np.ndarray,
+                              obj_ids_to_remove: np.ndarray) -> np.ndarray:
+    """
+    JIT optimized: find the events to keep
+
+    Args:
+        event_obj_ids: array of the first object ID of each event (N,)
+        obj_ids_to_remove: array of object IDs to delete (M,)
+
+    Returns:
+        mask: bool array, True keeps the event, False deletes it
+
+    Performance:
+        - O(N*M) integer comparisons; serial is enough (N=1e5, M=1 takes ~0.1 ms)
+        - [perf] It used to be parallel=True: with M~1 per step the cost of waking
+          the thread team dwarfed the work itself and reached ~10 ms per call when
+          MPI oversubscribed the cores; serial execution removes that overhead
+    """
+    n_events = len(event_obj_ids)
+    n_remove = len(obj_ids_to_remove)
+    mask = np.ones(n_events, dtype=np.bool_)
+
+    for i in range(n_events):
+        obj_id = event_obj_ids[i]
+        if obj_id < 0:
+            continue
+
+        # Is the object on the deletion list?
+        for j in range(n_remove):
+            if obj_id == obj_ids_to_remove[j]:
+                mask[i] = False
+                break
+
+    return mask
+
+
+# ===== Event category constants and unified classification =====
+
+CATEGORY_SINGLE = 0
+CATEGORY_PAIR = 1
+CATEGORY_ZERO = 2
+
+
+def classify_event_rows(events: np.ndarray) -> np.ndarray:
+    """[fix] Unified event classification: 0=single, 1=pair, 2=zero.
+
+    The prefix bits of id_high are preferred (bits 61-62, written uniformly by the
+    builders: single=0, pair=1, zero=2). Load balancing used to classify by the
+    'count of non-negative obj_ids' - but obj_ids[0] of a per-cell zero event is a
+    cell_id (>= 0), so such events were misfiled and silently skipped as ghosts.
+
+    Events without a usable 128-bit ID (legacy mode with id != 0, or id_high == 0
+    which cannot be told from an unfilled field) fall back to the non-negative count.
+    """
+    n = len(events)
+    if n == 0:
+        return np.empty(0, dtype=np.int8)
+
+    # Fallback: count the non-negative obj_ids
+    num_objs = np.sum(events['obj_ids'] >= 0, axis=1)
+    cats_count = np.where(
+        num_objs == 0, CATEGORY_ZERO,
+        np.where(num_objs == 1, CATEGORY_SINGLE, CATEGORY_PAIR)
+    ).astype(np.int8)
+
+    names = events.dtype.names
+    if 'id_high' not in names or 'id' not in names:
+        return cats_count
+
+    idh = events['id_high'].astype(np.int64)
+    prefix = ((idh >> 61) & 0x3).astype(np.int8)
+    use_prefix = (events['id'] == 0) & (idh != 0) & (prefix <= 2)
+    return np.where(use_prefix, prefix, cats_count).astype(np.int8)
+
+
+def classify_event_row(event) -> int:
+    """Single-record version of classify_event_rows (np.void)."""
+    names = event.dtype.names
+    if 'id_high' in names and 'id' in names:
+        idh = int(event['id_high'])
+        if int(event['id']) == 0 and idh != 0:
+            prefix = (idh >> 61) & 0x3
+            if prefix <= 2:
+                return prefix
+    num_objs = int(np.sum(event['obj_ids'] >= 0))
+    if num_objs == 0:
+        return CATEGORY_ZERO
+    if num_objs == 1:
+        return CATEGORY_SINGLE
+    return CATEGORY_PAIR
+
+
+# The hardcoded EVENT_DTYPE was removed
+# The dtype is now generated by TypeCompiler and passed to the constructor
+
+
+def create_default_event_dtype() -> np.dtype:
+    """
+    Create the default EVENT_DTYPE (v1.6.5-fix: 128-bit ID)
+
+    Used for:
+    - backward compatibility with code that does not use TypeCompiler
+    - tests and debugging
+
+    v1.6.5-fix changes:
+    - a 128-bit ID (id_high + id_low) replaces the 64-bit hash
+    - collisions become impossible
+    """
+    # The v1.6.2 defaults
+    MAX_PARAMS = 8       # slots for physics parameters
+    MAX_OBJS = 6         # participating objects (multi-object reactions)
+    TYPE_STR_LEN = 32    # length of the event type string
+
+    return np.dtype([
+        ('id',          np.int64),             # backward compatible: the id field is kept (deprecated)
+        ('id_high',     np.int64),             # [fix] high 64 bits of the 128-bit ID
+        ('id_low',      np.int64),             # [fix] low 64 bits of the 128-bit ID
+        ('event_type_id', np.int32),           # integer event type ID (hot path)
+        ('status',      np.int32),             # lock status
+        ('owner_rank',  np.int32),             # rank owning the result
+        ('rate',        np.float64),           # the computed rate
+        ('weight',      np.float64),           # estimated computational weight
+        ('obj_ids',     np.int64, (MAX_OBJS,)),   # participating object IDs (v1.6.2 mode)
+        ('params',      np.float64, (MAX_PARAMS,))# physics parameters
+    ], align=True)
+
+
+# Backward compatible: the EVENT_DTYPE global is kept (with the defaults)
+EVENT_DTYPE = create_default_event_dtype()
+
+
+class RMAEventPool:
+    """
+    Event pool (adaptive v1.6.3 version)
+
+    Holds the local storage of the three event classes:
+    - zero_obj_events: zero-object events (e.g. cascade)
+    - single_obj_events: single-object events (e.g. migration)
+    - pair_obj_events: pair events (e.g. capture, recombination)
+
+    RMA window:
+    - win_rate_sum: the rate sum window (for global rate synchronization)
+
+    v1.6.3 changes:
+    - accepts a dynamic dtype (adaptive memory layout)
+    - backward compatible: without a dtype the default EVENT_DTYPE is used
+    """
+
+    def __init__(self, comm: MPI.Comm,
+                 dtype: Optional[np.dtype] = None,
+                 capacity_zero: int = 100,
+                 capacity_single: int = 5000,
+                 capacity_pair: int = 5000,
+                 auto_expand: bool = True,
+                 verbose: bool = False):
+        """
+        Initialize the event pool
+
+        Args:
+            comm: MPI communicator
+            dtype: event data type (added in v1.6.3, optional)
+                  - None uses the default EVENT_DTYPE (v1.6.2 compatible)
+                  - generating it with TypeCompiler is recommended
+            capacity_zero: capacity for zero-object events
+            capacity_single: capacity for single-object events
+            capacity_pair: capacity for pair events
+            auto_expand: whether to grow automatically
+            verbose: whether to print details
+        """
+        self.comm = comm
+        self.rank = comm.rank
+        self.size = comm.size
+        self.auto_expand = auto_expand
+        self.verbose = verbose
+
+        # Dynamic dtype support
+        if dtype is None:
+            # Backward compatible: use the default dtype
+            self.dtype = EVENT_DTYPE
+            if self.verbose and self.rank == 0:
+                print("[RMAEventPool] Using default EVENT_DTYPE (v1.6.2 compatibility mode)")
+        else:
+            # v1.6.3 mode: use the dtype generated by TypeCompiler
+            self.dtype = dtype
+            if self.verbose and self.rank == 0:
+                print(f"[RMAEventPool] Using adaptive dtype (size={dtype.itemsize} bytes)")
+
+        # ===== The three event arrays (local storage) =====
+        self.capacity_zero = capacity_zero
+        self.capacity_single = capacity_single
+        self.capacity_pair = capacity_pair
+
+        self.count_zero = 0
+        self.count_single = 0
+        self.count_pair = 0
+
+        self.zero_obj_array = np.zeros(capacity_zero, dtype=self.dtype)
+        self.single_obj_array = np.zeros(capacity_single, dtype=self.dtype)
+        self.pair_obj_array = np.zeros(capacity_pair, dtype=self.dtype)
+
+        # Initialize obj_ids to -1 (meaning no object)
+        if 'obj_ids' in self.dtype.names:
+            self.zero_obj_array['obj_ids'][:] = -1
+            self.single_obj_array['obj_ids'][:] = -1
+            self.pair_obj_array['obj_ids'][:] = -1
+        if 'event_type_id' in self.dtype.names:
+            self.zero_obj_array['event_type_id'][:] = -1
+            self.single_obj_array['event_type_id'][:] = -1
+            self.pair_obj_array['event_type_id'][:] = -1
+
+        # ===== RMA window: the rate sum =====
+        # rate_sum_array[0] = the local rate sum
+        self.rate_sum_array = np.zeros(1, dtype=np.float64)
+        # With a single rank no window is created: no remote rank needs the
+        # rate sum, and this sidesteps MPI implementations that reject a one-rank window.
+        if comm.size > 1:
+            self.win_rate_sum = MPI.Win.Create(self.rate_sum_array, comm=comm)
+        else:
+            self.win_rate_sum = None
+        # Passive RMA (Lock/Unlock) is used instead of Fence
+        self.rate_sum_zero = 0.0
+        self.rate_sum_single = 0.0
+        self.rate_sum_pair = 0.0
+
+        if self.verbose and self.rank == 0:
+            print(f"[RMAEventPool] Initialized (v1.6.3):")
+            print(f"  - Zero-obj capacity: {capacity_zero}")
+            print(f"  - Single-obj capacity: {capacity_single}")
+            print(f"  - Pair-obj capacity: {capacity_pair}")
+            print(f"  - Event size: {self.dtype.itemsize} bytes")
+            print(f"  - RMA: Rate sum window only")
+
+    def _sum_valid_rates(self, events: np.ndarray) -> float:
+        """Sum the rates of every valid event in the slice."""
+        if len(events) == 0:
+            return 0.0
+        mask = (events['status'] == STATUS_DONE) & (events['rate'] >= 0.0)
+        if not np.any(mask):
+            return 0.0
+        return float(np.sum(events['rate'][mask], dtype=np.float64))
+
+    def _write_rate_sum_window(self):
+        """Publish the local total rate to the RMA window."""
+        self.rate_sum_array[0] = (
+            self.rate_sum_zero +
+            self.rate_sum_single +
+            self.rate_sum_pair
+        )
+
+    def clear_rate_sum(self, category: str):
+        """Zero the local total rate of one category."""
+        self.set_rate_sum(category, 0.0)
+
+    def set_rate_sum(self, category: str, value: float):
+        """Set the local total rate of one category directly."""
+        value = float(value)
+        if category == 'zero':
+            self.rate_sum_zero = value
+        elif category == 'single':
+            self.rate_sum_single = value
+        elif category == 'pair':
+            self.rate_sum_pair = value
+        else:
+            raise ValueError(f"Unknown category: {category}")
+        self._write_rate_sum_window()
+
+    def add_rate_sum_delta(self, category: str, delta: float):
+        """Add a new valid rate contribution to one category."""
+        delta = float(delta)
+        if delta == 0.0:
+            return
+        if category == 'zero':
+            self.rate_sum_zero += delta
+        elif category == 'single':
+            self.rate_sum_single += delta
+        elif category == 'pair':
+            self.rate_sum_pair += delta
+        else:
+            raise ValueError(f"Unknown category: {category}")
+        self._write_rate_sum_window()
+
+    def recompute_rate_sum(self, category: str):
+        """Recompute the local total rate of one category from the current pool."""
+        if category == 'zero':
+            self.rate_sum_zero = self._sum_valid_rates(
+                self.zero_obj_array[:self.count_zero]
+            )
+        elif category == 'single':
+            self.rate_sum_single = self._sum_valid_rates(
+                self.single_obj_array[:self.count_single]
+            )
+        elif category == 'pair':
+            self.rate_sum_pair = self._sum_valid_rates(
+                self.pair_obj_array[:self.count_pair]
+            )
+        else:
+            raise ValueError(f"Unknown category: {category}")
+        self._write_rate_sum_window()
+
+    def mark_rates_todo_by_type(self, type_ids: np.ndarray) -> int:
+        """
+        Invalidate the RATES of every event whose class is in type_ids
+
+        DONE events of those classes go back to TODO with rate 0 and the category sums
+        are recomputed; the event structure is untouched. Used by the engine when a
+        physics parameter or field that the rates of those classes depend on has
+        changed: the structure (which objects carry which events) never depends on a
+        parameter value, so nothing is rebuilt. BUSY and SENT events are left alone.
+
+        Args:
+            type_ids: array of global event_type_id values
+
+        Returns:
+            number of events reset
+        """
+        n_reset = 0
+        if len(type_ids) == 0:
+            return 0
+        type_ids = np.asarray(type_ids, dtype=np.int32)
+        for category, arr, n in (('zero', self.zero_obj_array, self.count_zero),
+                                 ('single', self.single_obj_array, self.count_single),
+                                 ('pair', self.pair_obj_array, self.count_pair)):
+            if n == 0:
+                continue
+            seg = arr[:n]
+            done = seg['status'] == STATUS_DONE
+            if 'event_type_id' in seg.dtype.names:
+                mask = done & np.isin(seg['event_type_id'], type_ids)
+            else:
+                mask = done
+            if np.any(mask):
+                seg['status'][mask] = STATUS_TODO
+                seg['rate'][mask] = 0.0
+                n_reset += int(np.count_nonzero(mask))
+                self.recompute_rate_sum(category)
+        return n_reset
+
+    def write_param_column_by_type(self, entries) -> int:
+        """
+        Refresh a cached parameter column of every event of a class
+
+        entries: iterable of (event_type_id, column, value). Scalar rate() classes get
+        their params resolved at build time and cached in event['params']; when such a
+        param comes from the physics module and the physics value changes, the cached
+        column is rewritten here instead of rebuilding the events.
+
+        Returns:
+            number of events written
+        """
+        entries = list(entries)
+        if not entries:
+            return 0
+        for arr in (self.zero_obj_array, self.single_obj_array, self.pair_obj_array):
+            if 'params' not in arr.dtype.names or 'event_type_id' not in arr.dtype.names:
+                return 0
+        max_params = self.single_obj_array.dtype.fields['params'][0].shape[0]
+        n_written = 0
+        for arr, n in ((self.zero_obj_array, self.count_zero),
+                       (self.single_obj_array, self.count_single),
+                       (self.pair_obj_array, self.count_pair)):
+            if n == 0:
+                continue
+            seg = arr[:n]
+            for type_id, col, value in entries:
+                if col < 0 or col >= max_params:
+                    continue
+                mask = seg['event_type_id'] == int(type_id)
+                if np.any(mask):
+                    seg['params'][mask, col] = float(value)
+                    n_written += int(np.count_nonzero(mask))
+        return n_written
+
+    def recompute_all_rate_sums(self):
+        """Recompute all three local total rates from the current pool."""
+        self.rate_sum_zero = self._sum_valid_rates(
+            self.zero_obj_array[:self.count_zero]
+        )
+        self.rate_sum_single = self._sum_valid_rates(
+            self.single_obj_array[:self.count_single]
+        )
+        self.rate_sum_pair = self._sum_valid_rates(
+            self.pair_obj_array[:self.count_pair]
+        )
+        self._write_rate_sum_window()
+
+    # ========================================
+    # Event insertion interface
+    # ========================================
+
+    def set_zero_obj_events(self, events: np.ndarray, recompute_rate_sum: bool = True):
+        """
+        Set the zero-object events (full replacement)
+
+        Args:
+            events: event array (EVENT_DTYPE)
+        """
+        n = len(events)
+
+        if n > self.capacity_zero:
+            if self.auto_expand:
+                self._expand_zero_capacity(n)
+            else:
+                raise RuntimeError(f"Zero-obj event pool is full: {n} > {self.capacity_zero}")
+
+        self.zero_obj_array[:n] = events
+        self.count_zero = n
+        if recompute_rate_sum:
+            self.recompute_rate_sum('zero')
+
+    def reset_zero_statuses(self, hold_mask: np.ndarray) -> None:
+        """[contract] Rate policy when the zero event structure is retained wholesale.
+
+        Events with hold_mask=True (class-level incremental_rate=True) that are already
+        DONE keep their rate; every other event is set to TODO with rate 0 so the rate
+        stage recomputes it: a zero event rate may depend on time or on a field.
+
+        Args:
+            hold_mask: bool array of shape (count_zero,)
+        """
+        n = self.count_zero
+        if n == 0:
+            self.rate_sum_zero = 0.0
+            self._write_rate_sum_window()
+            return
+        seg = self.zero_obj_array[:n]
+        hold = hold_mask & (seg['status'] == STATUS_DONE) & (seg['rate'] >= 0.0)
+        reset = ~hold
+        if np.any(reset):
+            seg['status'][reset] = STATUS_TODO
+            seg['rate'][reset] = 0.0
+        self.rate_sum_zero = float(np.sum(seg['rate'][hold], dtype=np.float64)) \
+            if np.any(hold) else 0.0
+        self._write_rate_sum_window()
+
+    def update_single_events_inplace(self, keep_mask: np.ndarray,
+                                     new_events: np.ndarray,
+                                     keep_rate_mask=None) -> int:
+        """In-place update of single-object events: compact and append, without rebuilding the array.
+
+        The **structure** of a single/zero-object event depends only on whether the object
+        exists and on its type; in one KMC step only the objects of the executed event
+        change. The old code rebuilt the event array for every object each step and copied
+
+          1. drop the events whose host object changed or vanished (keep_mask == False)
+          2. move the retained events forward in place, closing the holes (np.compress, inside the pool array)
+          3. append the events rebuilt for changed or new objects
+          4. retained events default to status TODO and rate 0, so the rate is recomputed;
+             events marked by keep_rate_mask (class-level incremental_rate=True) keep
+             their DONE status and rate (class-level rate increment)
+
+        Args:
+            keep_mask: bool array of shape (count_single,); True means the event is still valid
+            new_events: the events rebuilt for changed or new objects (may be empty)
+            keep_rate_mask: bool array of shape (count_single,) or None; True allows the
+                event to keep its DONE rate (keep_mask must hold as well)
+
+        Returns:
+            the updated count_single
+        """
+        n_old = self.count_single
+        n_new = len(new_events)
+        arr = self.single_obj_array
+
+        drop_idx = np.flatnonzero(~keep_mask) if n_old > 0 else np.empty(0, dtype=np.int64)
+        n_drop = len(drop_idx)
+
+        # Fast path: invalidated count == new count (the usual case: a few objects moved,
+        # the event count is unchanged). New events overwrite the invalid slots, an O(k)
+        # hold_pos: mask over the total length marking positions allowed to keep a DONE rate
+        if n_drop == n_new and n_new > 0:
+            arr[drop_idx] = new_events
+            total = n_old
+            hold_pos = (keep_mask & keep_rate_mask) \
+                if keep_rate_mask is not None else None
+        else:
+            # Slow path: insertions or deletions changed the event count, so compaction is needed
+            n_keep = n_old - n_drop
+            keep_idx = np.flatnonzero(keep_mask) if n_old > 0 else \
+                np.empty(0, dtype=np.int64)
+            if n_drop > 0 and n_keep > 0:
+                arr[:n_keep] = arr[keep_idx]
+            elif n_drop > 0:
+                n_keep = 0
+
+            total = n_keep + n_new
+            if total > self.capacity_single:
+                if not self.auto_expand:
+                    raise RuntimeError(
+                        f"Single-obj event pool is full: {total} > {self.capacity_single}")
+                self._expand_single_capacity(total)
+                arr = self.single_obj_array
+            if n_new > 0:
+                arr[n_keep:total] = new_events
+
+            hold_pos = None
+            if keep_rate_mask is not None and n_keep > 0:
+                hold_pos = np.zeros(total, dtype=np.bool_)
+                hold_pos[:n_keep] = keep_rate_mask[keep_idx]
+
+        # Status policy for the retained segment: TODO/rate 0 by default (a structural
+        # increment is not a rate increment); a hold position already in DONE keeps its rate
+        # (new events have keep_mask=False and never enter hold)
+        kept_rate_sum = 0.0
+        if total > 0:
+            seg = arr[:total]
+            if hold_pos is not None:
+                hold = (hold_pos[:total]
+                        & (seg['status'] == STATUS_DONE)
+                        & (seg['rate'] >= 0.0))
+            else:
+                hold = np.zeros(total, dtype=np.bool_)
+            reset = ~hold
+            if np.any(reset):
+                seg['status'][reset] = STATUS_TODO
+                seg['rate'][reset] = 0.0
+            if np.any(hold):
+                kept_rate_sum = float(np.sum(seg['rate'][hold], dtype=np.float64))
+
+        self.count_single = total
+        self.rate_sum_single = kept_rate_sum
+        self._write_rate_sum_window()
+        return total
+
+    def set_single_obj_events(self, events: np.ndarray, recompute_rate_sum: bool = True):
+        """
+        Set the single-object events (full replacement)
+
+        Args:
+            events: event array (EVENT_DTYPE)
+        """
+        n = len(events)
+
+        if n > self.capacity_single:
+            if self.auto_expand:
+                self._expand_single_capacity(n)
+            else:
+                raise RuntimeError(f"Single-obj event pool is full: {n} > {self.capacity_single}")
+
+        self.single_obj_array[:n] = events
+        self.count_single = n
+        if recompute_rate_sum:
+            self.recompute_rate_sum('single')
+
+    def update_pair_events_inplace(self, keep_mask: np.ndarray,
+                                   new_events: np.ndarray,
+                                   keep_rate_mask=None) -> int:
+        """[pair-inc] In-place update of pair events: compact away the poisoned zone and append the rebuilt events.
+
+        Structural increment semantics:
+        - events with keep_mask=False (invalid) are removed (the owner rebuilds them in the zone)
+        - retained events default to status TODO and rate 0 (a structural increment is not a rate increment)
+        - keep_rate_mask marks the events allowed to keep a DONE rate
+          (class-level incremental_rate=True and no physics change this step)
+        - SENT events are kept untouched: the live copy sits on the stealing rank and this
+          pool keeps a husk; the kill predicate covers SENT too (a uniform verdict).
+
+        Args:
+            keep_mask: (count_pair,) bool, True = structurally retained
+            new_events: the rebuild output of the zone (already TODO/rate=0 from the builder)
+            keep_rate_mask: (count_pair,) bool or None
+
+        Returns:
+            the updated count_pair
+        """
+        n_old = self.count_pair
+        n_new = len(new_events)
+        arr = self.pair_obj_array
+
+        if n_old > 0:
+            keep_idx = np.flatnonzero(keep_mask)
+            n_keep = len(keep_idx)
+            if n_keep < n_old:
+                arr[:n_keep] = arr[keep_idx]
+            if keep_rate_mask is not None:
+                keep_rate_kept = keep_rate_mask[keep_idx]
+        else:
+            n_keep = 0
+
+        total = n_keep + n_new
+        if total > self.capacity_pair:
+            if not self.auto_expand:
+                raise RuntimeError(
+                    f"Pair-obj event pool is full: {total} > {self.capacity_pair}")
+            self._expand_pair_capacity(max(total, self.capacity_pair * 2))
+            arr = self.pair_obj_array
+
+        if n_new > 0:
+            arr[n_keep:total] = new_events
+
+        # Status policy for the retained segment
+        kept_rate_sum = 0.0
+        if n_keep > 0:
+            kept = arr[:n_keep]
+            sent = kept['status'] == STATUS_SENT
+            if keep_rate_mask is not None:
+                hold = (keep_rate_kept
+                        & (kept['status'] == STATUS_DONE)
+                        & (kept['rate'] >= 0.0)
+                        & ~sent)
+            else:
+                hold = np.zeros(n_keep, dtype=np.bool_)
+            reset = ~sent & ~hold
+            if np.any(reset):
+                kept['status'][reset] = STATUS_TODO
+                kept['rate'][reset] = 0.0
+            if np.any(hold):
+                kept_rate_sum = float(np.sum(kept['rate'][hold], dtype=np.float64))
+
+        self.count_pair = total
+        self.rate_sum_pair = kept_rate_sum
+        self._write_rate_sum_window()
+        return total
+
+    def set_pair_obj_events(self, events: np.ndarray, recompute_rate_sum: bool = True):
+        """
+        Set the pair events (full replacement)
+
+        Args:
+            events: event array (EVENT_DTYPE)
+        """
+        n = len(events)
+
+        if n > self.capacity_pair:
+            if self.auto_expand:
+                self._expand_pair_capacity(n)
+            else:
+                raise RuntimeError(f"Pair-obj event pool is full: {n} > {self.capacity_pair}")
+
+        self.pair_obj_array[:n] = events
+        self.count_pair = n
+        if recompute_rate_sum:
+            self.recompute_rate_sum('pair')
+
+    # [Bug 4 fix] A safe append that never replaces the array inside the compute loop
+    def append_events(self, zero_events: np.ndarray = None,
+                      single_events: np.ndarray = None,
+                      pair_events: np.ndarray = None):
+        """
+        Append events to the existing pool safely, without replacing the array
+
+        Args:
+            zero_events: array of zero-object events (optional)
+            single_events: array of single-object events (optional)
+            pair_events: array of pair events (optional)
+
+        Note:
+            Designed for runtime load balancing, so new work can be received safely
+            inside the compute loop; capacity is checked first and grown without loss.
+        """
+        # Append the zero-object events
+        if zero_events is not None and len(zero_events) > 0:
+            start = self.count_zero
+            new_count = self.count_zero + len(zero_events)
+            if new_count > self.capacity_zero:
+                if self.auto_expand:
+                    self._expand_zero_capacity(new_count)
+                else:
+                    raise RuntimeError(f"Zero-obj event pool full: {new_count} > {self.capacity_zero}")
+
+            # Append into the existing array (no replacement)
+            self.zero_obj_array[start:new_count] = zero_events
+            self.count_zero = new_count
+            self.add_rate_sum_delta('zero', self._sum_valid_rates(self.zero_obj_array[start:new_count]))
+
+        # Append the single-object events
+        if single_events is not None and len(single_events) > 0:
+            start = self.count_single
+            new_count = self.count_single + len(single_events)
+            if new_count > self.capacity_single:
+                if self.auto_expand:
+                    self._expand_single_capacity(new_count)
+                else:
+                    raise RuntimeError(f"Single-obj event pool full: {new_count} > {self.capacity_single}")
+
+            # Append into the existing array (no replacement)
+            self.single_obj_array[start:new_count] = single_events
+            self.count_single = new_count
+            self.add_rate_sum_delta('single', self._sum_valid_rates(self.single_obj_array[start:new_count]))
+
+        # Append the pair events
+        if pair_events is not None and len(pair_events) > 0:
+            start = self.count_pair
+            new_count = self.count_pair + len(pair_events)
+            if new_count > self.capacity_pair:
+                if self.auto_expand:
+                    self._expand_pair_capacity(new_count)
+                else:
+                    raise RuntimeError(f"Pair-obj event pool full: {new_count} > {self.capacity_pair}")
+
+            # Append into the existing array (no replacement)
+            self.pair_obj_array[start:new_count] = pair_events
+            self.count_pair = new_count
+            self.add_rate_sum_delta('pair', self._sum_valid_rates(self.pair_obj_array[start:new_count]))
+
+    def purge_sent_events(self) -> int:
+        """Drop the SENT husks left by runtime work stealing.
+
+        A stolen event is marked SENT (rate 0) during the rate loop, because deleting it
+        there would invalidate the iteration. After the step it is just a dead record: the
+        live copy belongs to the thief from now on, exactly as an event moved by the
+        predictive level. Removing the husk before the next build makes the two cases
+        identical, so the in-place update cannot revive it as a TODO event.
+
+        Returns:
+            the number of husks removed
+        """
+        removed = 0
+        for setter, arr, n in ((self.set_zero_obj_events, self.zero_obj_array, self.count_zero),
+                               (self.set_single_obj_events, self.single_obj_array, self.count_single),
+                               (self.set_pair_obj_events, self.pair_obj_array, self.count_pair)):
+            if n == 0:
+                continue
+            seg = arr[:n]
+            sent = seg['status'] == STATUS_SENT
+            k = int(np.count_nonzero(sent))
+            if k:
+                setter(seg[~sent].copy())
+                removed += k
+        return removed
+
+    def remove_events_for_objects(self, obj_ids_to_remove: np.ndarray):
+        """
+        Delete every single-object event referring to the given objects (ghost event cleanup)
+
+        Purpose:
+        - when an object is deleted or modified, clear the stale events referring to it on every rank
+        - prevents ghost events from being reused after runtime load balancing
+
+        Args:
+            obj_ids_to_remove: array of object IDs to delete
+
+        Note:
+        - only single-object events are handled (pair events are rebuilt in full each step)
+        - a JIT parallel scan is used for speed
+        - every rank should call this, because an event may have been stolen by any rank
+        """
+        if len(obj_ids_to_remove) == 0:
+            return
+
+        # Only single-object events
+        if self.count_single == 0:
+            return
+
+        n = self.count_single
+        single_events = self.single_obj_array[:n]
+
+        # Extract the first object ID of each event (single-object events)
+        event_obj_ids = np.ascontiguousarray(single_events['obj_ids'][:, 0])
+
+        # JIT scan: find the events to keep
+        # For a small deletion set (M < 100) use the JIT version
+        # For a large one (M >= 100) use NumPy vectorization (np.isin optimizes better)
+        if len(obj_ids_to_remove) < 100:
+            to_keep = _find_events_to_keep_jit(
+                event_obj_ids,
+                np.ascontiguousarray(obj_ids_to_remove, dtype=np.int64))
+        else:
+            to_keep = ~np.isin(event_obj_ids, obj_ids_to_remove)
+
+        drop_idx = np.flatnonzero(~to_keep)
+        n_removed = len(drop_idx)
+        if n_removed == 0:
+            return
+
+        # [perf] Subtract the rate contribution of the deleted events incrementally
+        # (matching the old recompute semantics: only DONE events with rate >= 0 count).
+        # The deleted records must be read before the slots are moved.
+        removed = single_events[drop_idx]
+        done_mask = (removed['status'] == STATUS_DONE) & (removed['rate'] >= 0.0)
+        removed_rate = float(np.sum(removed['rate'][done_mask], dtype=np.float64))
+
+        # [perf] Swap-remove in place, O(number deleted).
+        # The old implementation did a fancy-index full copy, wrote the whole pool back
+        # and recomputed the rate in O(N) - with ~1 KB self-contained events that copied
+        # the entire single pool twice per step (~29 ms/step in the 10^5-object benchmark), giving back
+        # every O(N) saving the in-place construction had won. Event order does not matter:
+        arr = self.single_obj_array
+        for idx in drop_idx[::-1]:
+            if idx < n - 1:
+                arr[idx] = arr[n - 1]
+            n -= 1
+        self.count_single = n
+
+        if removed_rate != 0.0:
+            self.add_rate_sum_delta('single', -removed_rate)
+
+        # [fix] Force an exact zero when the pool empties: incremental addition and
+        # subtraction leave ULP residue on rates of order 1e12 (e.g. 2^-10), and once the
+        # pool is empty that residue becomes phantom rate mass - the rank still wins the
+        # global draw yet has no event to execute. The old full recompute erased the
+        if self.count_single == 0:
+            self.set_rate_sum('single', 0.0)
+
+        if self.verbose:
+            print(f"[Rank {self.rank}] Removed {n_removed} ghost events for {len(obj_ids_to_remove)} changed/deleted objects")
+
+    # ========================================
+    # Query interface
+    # ========================================
+
+    def get_total_count(self) -> int:
+        """Total number of events across the three classes"""
+        return self.count_zero + self.count_single + self.count_pair
+
+    def get_counts(self) -> Tuple[int, int, int]:
+        """Number of events per class (zero, single, pair)"""
+        return (self.count_zero, self.count_single, self.count_pair)
+
+    def get_total_rate(self) -> float:
+        """
+        Total rate over the three event classes
+
+        Also refreshes rate_sum_array[0] in the RMA window for remote reads
+        """
+        self._write_rate_sum_window()
+        return float(self.rate_sum_array[0])
+
+    def get_all_events(self) -> np.ndarray:
+        """
+        Get every event (the three classes merged)
+
+        Returns:
+            event array (EVENT_DTYPE)
+        """
+        events_list = []
+
+        if self.count_zero > 0:
+            events_list.append(self.zero_obj_array[:self.count_zero])
+        if self.count_single > 0:
+            events_list.append(self.single_obj_array[:self.count_single])
+        if self.count_pair > 0:
+            events_list.append(self.pair_obj_array[:self.count_pair])
+
+        if events_list:
+            return np.concatenate(events_list)
+        else:
+            return np.array([], dtype=self.dtype)  # use self.dtype
+
+    def get_zero_obj_events(self) -> np.ndarray:
+        """Get the zero-object events"""
+        return self.zero_obj_array[:self.count_zero].copy()
+
+    def get_single_obj_events(self) -> np.ndarray:
+        """Get the single-object events"""
+        return self.single_obj_array[:self.count_single].copy()
+
+    def get_pair_obj_events(self) -> np.ndarray:
+        """Get the pair events"""
+        return self.pair_obj_array[:self.count_pair].copy()
+
+    # ========================================
+    # State management interface (incremental update and load balancing)
+    # ========================================
+
+    def save_events_snapshot(self):
+        """
+        Save a snapshot of the current events (for the incremental update)
+
+        Without a rebuild the old events can be restored (rate and status=2 included)
+        """
+        self.prev_zero_events = self.zero_obj_array[:self.count_zero].copy()
+        self.prev_single_events = self.single_obj_array[:self.count_single].copy()
+        self.prev_pair_events = self.pair_obj_array[:self.count_pair].copy()
+
+        self.prev_count_zero = self.count_zero
+        self.prev_count_single = self.count_single
+        self.prev_count_pair = self.count_pair
+
+    def restore_events_from_snapshot(self, zero: bool = False, single: bool = False, pair: bool = False):
+        """
+        Restore the events from the snapshot (when the incremental update skips a rebuild)
+
+        Args:
+            zero: whether to restore the zero-object events
+            single: whether to restore the single-object events
+            pair: whether to restore the pair events
+        """
+        if zero and hasattr(self, 'prev_zero_events'):
+            self.zero_obj_array[:self.prev_count_zero] = self.prev_zero_events
+            self.count_zero = self.prev_count_zero
+            self.recompute_rate_sum('zero')
+
+        if single and hasattr(self, 'prev_single_events'):
+            self.single_obj_array[:self.prev_count_single] = self.prev_single_events
+            self.count_single = self.prev_count_single
+            self.recompute_rate_sum('single')
+
+        if pair and hasattr(self, 'prev_pair_events'):
+            self.pair_obj_array[:self.prev_count_pair] = self.prev_pair_events
+            self.count_pair = self.prev_count_pair
+            self.recompute_rate_sum('pair')
+
+    def batch_update_status(self, category: str, start: int, end: int, new_status: int):
+        """
+        Update the event status in bulk
+
+        Args:
+            category: 'zero', 'single' or 'pair'
+            start: first index
+            end: last index (exclusive)
+            new_status: the new status (STATUS_TODO=0, STATUS_BUSY=1, STATUS_DONE=2)
+        """
+        if category == 'zero':
+            self.zero_obj_array[start:end]['status'] = new_status
+        elif category == 'single':
+            self.single_obj_array[start:end]['status'] = new_status
+        elif category == 'pair':
+            self.pair_obj_array[start:end]['status'] = new_status
+        self.recompute_rate_sum(category)
+
+    def batch_update_rates_and_status(self, category: str, indices: List[int],
+                                      rates: np.ndarray, new_status: int):
+        """
+        Update rates and statuses in bulk
+
+        Args:
+            category: 'zero', 'single' or 'pair'
+            indices: list of event indices
+            rates: array of rates
+            new_status: the new status
+        """
+        clamped_rates = np.maximum(np.asarray(rates, dtype=np.float64), 0.0)
+        if category == 'zero':
+            self.zero_obj_array['rate'][indices] = clamped_rates
+            self.zero_obj_array['status'][indices] = new_status
+        elif category == 'single':
+            self.single_obj_array['rate'][indices] = clamped_rates
+            self.single_obj_array['status'][indices] = new_status
+        elif category == 'pair':
+            self.pair_obj_array['rate'][indices] = clamped_rates
+            self.pair_obj_array['status'][indices] = new_status
+        self.recompute_rate_sum(category)
+
+    def flush_local_visibility(self):
+        """
+        In passive RMA mode a local update is visible to a remote Lock/Get/Unlock
+
+        Semantics of passive RMA (Lock/Unlock):
+        - a Lock implies memory synchronization
+        - a remote rank using Lock+Get+Unlock therefore sees the latest local data
+        - no explicit Sync() or Fence() call is needed
+
+        So this method is a no-op in v1.6.5.
+        """
+        pass  # nothing to do in passive RMA mode
+
+    def get_events_by_status(self, category: str, status: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get the events in a given status
+
+        Args:
+            category: 'zero', 'single' or 'pair'
+            status: the status value
+
+        Returns:
+            (events, indices): the event array and the matching index array
+        """
+        if category == 'zero':
+            count = self.count_zero
+            array = self.zero_obj_array
+        elif category == 'single':
+            count = self.count_single
+            array = self.single_obj_array
+        elif category == 'pair':
+            count = self.count_pair
+            array = self.pair_obj_array
+        else:
+            return np.array([], dtype=self.dtype), np.array([], dtype=np.int32)  # use self.dtype
+
+        mask = array[:count]['status'] == status
+        indices = np.where(mask)[0]
+        events = array[indices].copy()
+
+        return events, indices
+
+
+    # ========================================
+    # Synchronization interface
+    # ========================================
+
+    def sync(self):
+        """Synchronize every rank (with a Barrier)"""
+        self.comm.Barrier()
+
+    # ========================================
+    # Growth interface
+    # ========================================
+
+    def _expand_zero_capacity(self, new_capacity: int):
+        """Grow the zero-object event array (a local operation)"""
+        if self.verbose:
+            print(f"[Rank {self.rank}] Expanding zero-obj capacity: "
+                  f"{self.capacity_zero} -> {new_capacity}")
+
+        old_events = self.zero_obj_array[:self.count_zero].copy()
+        self.zero_obj_array = np.zeros(new_capacity, dtype=self.dtype)  # use self.dtype
+        self.zero_obj_array[:self.count_zero] = old_events
+        self.capacity_zero = new_capacity
+
+    def _expand_single_capacity(self, new_capacity: int):
+        """Grow the single-object event array (a local operation)"""
+        if self.verbose:
+            print(f"[Rank {self.rank}] Expanding single-obj capacity: "
+                  f"{self.capacity_single} -> {new_capacity}")
+
+        old_events = self.single_obj_array[:self.count_single].copy()
+        self.single_obj_array = np.zeros(new_capacity, dtype=self.dtype)  # use self.dtype
+        self.single_obj_array[:self.count_single] = old_events
+        self.capacity_single = new_capacity
+
+    def _expand_pair_capacity(self, new_capacity: int):
+        """Grow the pair event array (a local operation)"""
+        if self.verbose:
+            print(f"[Rank {self.rank}] Expanding pair-obj capacity: "
+                  f"{self.capacity_pair} -> {new_capacity}")
+
+        old_events = self.pair_obj_array[:self.count_pair].copy()
+        self.pair_obj_array = np.zeros(new_capacity, dtype=self.dtype)  # use self.dtype
+        self.pair_obj_array[:self.count_pair] = old_events
+        self.capacity_pair = new_capacity
+
+    # ========================================
+    # Incremental update interface (the v1.6.1 O(delta) optimization)
+    # ========================================
+
+    def batch_reset_status(self, category: str, new_status: int = STATUS_TODO):
+        """
+        Reset the statuses in bulk, quickly (fixes the status deadlock bug)
+
+        Core features:
+        - operates on the NumPy array directly, with no Python loop
+        - very cheap: a single O(1) broadcast assignment
+        - used when the incremental update reuses old events and must reset their status
+
+        Args:
+            category: 'zero', 'single', 'pair'
+            new_status: the new status (default STATUS_TODO = 0)
+
+        Example:
+            pool.batch_reset_status('single', STATUS_TODO)  # mark every single-object event pending
+        """
+        if category == 'zero':
+            if self.count_zero > 0:
+                self.zero_obj_array[:self.count_zero]['status'] = new_status
+        elif category == 'single':
+            if self.count_single > 0:
+                self.single_obj_array[:self.count_single]['status'] = new_status
+        elif category == 'pair':
+            if self.count_pair > 0:
+                self.pair_obj_array[:self.count_pair]['status'] = new_status
+        else:
+            raise ValueError(f"Unknown category: {category}")
+        self.recompute_rate_sum(category)
+
+    def save_events_snapshot(self):
+        """
+        Save a snapshot of the current events (reused by the incremental builder)
+
+        Core features:
+        - saves the old events before the new ones are built
+        - lets the incremental mode of ParallelEventBuilder reuse the events of unchanged objects
+        - uses .copy() so the data is independent and survives a later set_events
+
+        Internal storage:
+            self.prev_zero_events: np.ndarray
+            self.prev_single_events: np.ndarray
+            self.prev_pair_events: np.ndarray
+
+        When to call:
+            before event_builder.build_all_events() inside _build_events()
+        """
+        if self.count_zero > 0:
+            self.prev_zero_events = self.zero_obj_array[:self.count_zero].copy()
+        else:
+            self.prev_zero_events = np.array([], dtype=self.dtype)  # use self.dtype
+
+        if self.count_single > 0:
+            self.prev_single_events = self.single_obj_array[:self.count_single].copy()
+        else:
+            self.prev_single_events = np.array([], dtype=self.dtype)  # use self.dtype
+
+        if self.count_pair > 0:
+            self.prev_pair_events = self.pair_obj_array[:self.count_pair].copy()
+        else:
+            self.prev_pair_events = np.array([], dtype=self.dtype)  # use self.dtype
+
+    # ========================================
+    # Cleanup interface
+    # ========================================
+
+    def reset(self):
+        """Reset every event (empty the pool)"""
+        self.count_zero = 0
+        self.count_single = 0
+        self.count_pair = 0
+        self.rate_sum_zero = 0.0
+        self.rate_sum_single = 0.0
+        self.rate_sum_pair = 0.0
+        self._write_rate_sum_window()
+
+    def destroy(self):
+        """Destroy the RMA window"""
+        # Free the rate sum window
+        if self.win_rate_sum is not None:
+            self.win_rate_sum.Free()
+
+        if self.verbose and self.rank == 0:
+            print("[RMAEventPool] Destroyed (v1.6.1 Simplified)")
+
+    # ========================================
+    # Statistics interface
+    # ========================================
+
+    def get_stats(self) -> Dict[str, int]:
+        """
+        Get the event pool statistics
+
+        Returns:
+            {
+                'count_zero': number of zero-object events,
+                'count_single': number of single-object events,
+                'count_pair': number of pair events,
+                'total': total number of events,
+                'capacity_zero': zero-object capacity,
+                'capacity_single': single-object capacity,
+                'capacity_pair': pair capacity,
+            }
+        """
+        return {
+            'count_zero': self.count_zero,
+            'count_single': self.count_single,
+            'count_pair': self.count_pair,
+            'total': self.get_total_count(),
+            'capacity_zero': self.capacity_zero,
+            'capacity_single': self.capacity_single,
+            'capacity_pair': self.capacity_pair,
+        }
+
+
+# ===== Factory function =====
+
+def create_rma_event_pool(comm: MPI.Comm,
+                          dtype: Optional[np.dtype] = None,
+                          capacity_zero: int = 100,
+                          capacity_single: int = 5000,
+                          capacity_pair: int = 5000,
+                          auto_expand: bool = True,
+                          verbose: bool = False) -> RMAEventPool:
+    """
+    Factory: create an RMA event pool
+
+    Args:
+        comm: MPI communicator
+        dtype: event data type (added in v1.6.3, optional)
+              - None uses the default EVENT_DTYPE (v1.6.2 compatible)
+              - generating it with TypeCompiler is recommended
+        capacity_zero: capacity for zero-object events
+        capacity_single: capacity for single-object events
+        capacity_pair: capacity for pair events
+        auto_expand: whether to grow automatically
+        verbose: whether to print details
+
+    Returns:
+        an RMAEventPool instance
+    """
+    return RMAEventPool(comm, dtype, capacity_zero, capacity_single, capacity_pair, auto_expand, verbose)
+
+
+# ===== Helper: create an event =====
+
+def create_event(event_id: int = 0, event_type: str = '', obj_ids: List[int] = None,
+                 params: List[float] = None, owner_rank: int = 0,
+                 rate: float = 0.0, weight: float = 1.0,
+                 dtype: Optional[np.dtype] = None,
+                 id_high: Optional[int] = None, id_low: Optional[int] = None,
+                 config: Optional[dict] = None,
+                 event_type_id: Optional[int] = None) -> np.ndarray:
+    """
+    Create an event (helper)
+
+    Args:
+        event_id: event ID (backward compatible; since v1.6.5-fix id_high/id_low win)
+        event_type: event type
+        obj_ids: list of participating object IDs (v1.6.2 mode)
+        params: list of physics parameters
+        owner_rank: owning rank
+        rate: rate
+        weight: weight
+        dtype: event data type (optional, highest priority)
+        id_high: [fix] high 64 bits of the 128-bit ID (optional, preferred)
+        id_low: [fix] low 64 bits of the 128-bit ID (optional, preferred)
+        config: configuration dict (optional, v1.6.5)
+               when given, config['_event_dtype'] is preferred
+
+    Returns:
+        the event record (EVENT_DTYPE or a custom dtype)
+
+    dtype resolution order:
+        1. the explicit dtype argument (highest priority)
+        2. config['_event_dtype'] (the adaptive dtype from TypeCompiler)
+        3. the default EVENT_DTYPE (backward compatible)
+
+    Note:
+    - v1.6.2 mode: object IDs live in the 'obj_ids' field
+    - v1.6.3 mode: the full object data lives in 'objects' (filled by ParallelEventBuilder)
+    - v1.6.5-fix: id_high/id_low are preferred, falling back to event_id
+    """
+    # Defaults
+    if obj_ids is None:
+        obj_ids = []
+    if params is None:
+        params = []
+
+    # dtype resolution order
+    if dtype is None:
+        if config is not None and '_event_dtype' in config:
+            # Prefer the adaptive dtype from TypeCompiler
+            dtype = config['_event_dtype']
+        else:
+            # Backward compatible: use the default dtype
+            dtype = EVENT_DTYPE
+
+    event = np.zeros(1, dtype=dtype)[0]
+
+    # [fix] Basic fields (128-bit ID supported)
+    if id_high is not None and id_low is not None:
+        # New mode: use the 128-bit ID
+        if 'id_high' in dtype.names:
+            event['id_high'] = id_high
+        if 'id_low' in dtype.names:
+            event['id_low'] = id_low
+        # [fix] For a 128-bit ID event the 'id' field is set to 0 (no clash with 64-bit IDs)
+        event['id'] = 0
+    else:
+        # Old mode: use the 64-bit ID
+        event['id'] = event_id
+        # Fill the 128-bit fields as well when the dtype has them
+        if 'id_high' in dtype.names:
+            event['id_high'] = event_id
+        if 'id_low' in dtype.names:
+            event['id_low'] = 0
+
+    if 'event_type_id' in dtype.names:
+        if event_type_id is None and config is not None:
+            event_type_id = config.get('_event_name_to_int', {}).get(event_type, -1)
+        event['event_type_id'] = -1 if event_type_id is None else event_type_id
+    event['status'] = STATUS_TODO
+    event['rate'] = rate
+    event['weight'] = weight
+
+    # owner_rank field (optional)
+    if 'owner_rank' in dtype.names:
+        event['owner_rank'] = owner_rank
+
+    # Handle the object references (v1.6.2 compatibility mode)
+    if 'obj_ids' in dtype.names:
+        # v1.6.2 mode: fill in the object IDs (padding with -1)
+        max_objs = dtype.fields['obj_ids'][0].shape[0]
+        for i in range(min(len(obj_ids), max_objs)):
+            event['obj_ids'][i] = obj_ids[i]
+        for i in range(len(obj_ids), max_objs):
+            event['obj_ids'][i] = -1
+
+    # Handle self-contained objects (the new mode)
+    # Note: the 'objects' field is filled by ParallelEventBuilder, not here
+
+    # Fill the parameters
+    if 'params' in dtype.names:
+        max_params = dtype.fields['params'][0].shape[0]
+        for i in range(min(len(params), max_params)):
+            event['params'][i] = params[i]
+
+    return event
+
+
+if __name__ == "__main__":
+    # A simple test
+    comm = MPI.COMM_WORLD
+    rank = comm.rank
+    size = comm.size
+
+    print(f"[Rank {rank}] RMA Event Pool test - basic functionality OK")
+    print(f"[Rank {rank}] EVENT_DTYPE size: {EVENT_DTYPE.itemsize} bytes")
+
+    # Create the event pool
+    pool = create_rma_event_pool(
+        comm,
+        capacity_zero=10,
+        capacity_single=50,
+        capacity_pair=50,
+        verbose=(rank == 0)
+    )
+
+    # Every rank creates a few events
+    # Zero-object event
+    zero_events = [create_event(rank * 1000, 'cascade', [], [100.0, 200.0], rank)]
+
+    # Single-object event
+    single_events = [
+        create_event(rank * 1000 + i, 'migration', [rank * 10 + i], [1.0, 2.0], rank)
+        for i in range(5)
+    ]
+
+    # Pair event
+    pair_events = [
+        create_event(rank * 1000 + 100 + i, 'capture', [rank * 10 + i, rank * 10 + i + 1],
+                     [0.5, 1.5], rank)
+        for i in range(3)
+    ]
+
+    # Install the events
+    pool.set_zero_obj_events(np.array(zero_events))
+    pool.set_single_obj_events(np.array(single_events))
+    pool.set_pair_obj_events(np.array(pair_events))
+
+    # Synchronize
+    pool.sync()
+
+    # Test the queries
+    stats = pool.get_stats()
+    print(f"[Rank {rank}] Stats: {stats}")
+
+    total_rate = pool.get_total_rate()
+    print(f"[Rank {rank}] Total rate: {total_rate:.2f}")
+
+    # Clean up
+    pool.destroy()
+    print(f"[Rank {rank}] Test completed")

@@ -1,0 +1,17 @@
+# One-step installation:   conda env create -f environment.yml
+# Run it from this directory (the release root). It creates the environment "paraokmc"
+# with all dependencies from conda-forge, including an MPI library (MPICH) that mpi4py
+# is linked against, and installs ParaOKMC itself from this directory.
+name: paraokmc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.19
+  - scipy>=1.5
+  - numba>=0.55
+  - mpich              # the MPI library; replace by openmpi if you prefer
+  - mpi4py>=3.0
+  - pip
+  - pip:
+      - .              # ParaOKMC from this directory

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paraokmc"
+dynamic = ["version"]
+description = "ParaOKMC: Parallel Object Kinetic Monte Carlo Framework"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "numpy>=1.19",
+    "mpi4py>=3.0",
+    "scipy>=1.5",
+    "numba>=0.55",
+]
+
+[project.optional-dependencies]
+dedalus = ["dedalus>=3.0"]
+
+[tool.setuptools.dynamic]
+version = {attr = "paraokmc._version.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["paraokmc*"]

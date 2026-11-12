@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+
+.pytest_cache/
+.benchmarks/
+
+*.egg-info/
+build/
+dist/
+
+.venv/
+venv/
+.env
+
+.DS_Store
+
+# scratch output of the tutorial scripts and regenerated figures
+tutorial/out/
+example/figures/out/
+
+# OVITO frames are shipped as example/<section>/dump.tar.gz; reruns write dump/ here
+example/*/dump/
+
+# default output directory of example/3.1_free_diffusion/run_diffusion_balance.py
+e0_out/
+
+# Computed results of the paper's runs are distributed with the CPC program package,
+# not in this repository; reruns write them here.
+example/*/data/
+example/**/dump*.tar.gz
+example/**/logs_*.tar.gz
+example/**/*.csv

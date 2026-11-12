@@ -1,0 +1,62 @@
+{% set name = "paraokmc" %}
+{% set version = "2.0.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  skip: true  # [py<39]
+  script: {{ PYTHON }} -m pip install . -vv
+
+requirements:
+  host:
+    - python
+    - pip
+    - setuptools >=68.0
+    - wheel
+  run:
+    - python
+    - numpy >=1.19
+    - mpi4py >=3.0
+    - scipy >=1.5
+    - numba >=0.55
+
+test:
+  imports:
+    - paraokmc
+    - paraokmc.v16_engine
+    - paraokmc.rma_object_pool
+    - paraokmc.rma_event_pool
+  commands:
+    - python -c "from paraokmc._version import __version__; print(__version__)"
+
+about:
+  license: Apache-2.0
+  license_family: Apache
+  license_file:
+    - LICENSE
+    - NOTICE
+    - AUTHORS
+  summary: 'ParaOKMC: Parallel Object Kinetic Monte Carlo Framework'
+  description: |
+    ParaOKMC is a high-performance parallel Object Kinetic Monte Carlo (OKMC)
+    simulation framework designed for materials science applications.
+
+    Key Features:
+    - Three-layer load balancing system for handling spatial hotspots
+    - JIT acceleration with Numba
+    - MPI-RMA one-sided communication for efficient parallel scaling
+    - Event class system for easy customization
+    - Unified physics module for external field coupling
+
+    Applications:
+    - Radiation damage simulation
+    - Hydrogen diffusion and clustering
+    - Precipitation and phase transformation
+    - General OKMC simulations requiring high parallel efficiency
+
